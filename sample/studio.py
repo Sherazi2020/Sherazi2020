@@ -27,8 +27,10 @@ SR = 44100
 FPS = 30
 FONT_DIR = "/usr/share/fonts/opentype/inter/"
 FONTS = {"thin": "Inter-Thin.otf", "xlight": "Inter-ExtraLight.otf", "light": "Inter-Light.otf",
-         "reg": "Inter-Regular.otf", "med": "Inter-Medium.otf", "semi": "Inter-SemiBold.otf"}
-CHANNEL = "D E E P   C A L M"
+         "reg": "Inter-Regular.otf", "med": "Inter-Medium.otf", "semi": "Inter-SemiBold.otf",
+         "bold": "Inter-Bold.otf", "xbold": "Inter-ExtraBold.otf"}
+CHANNEL_NAME = "Little Lanterns"
+CHANNEL = "L I T T L E   L A N T E R N S"
 
 
 # ----------------------------------------------------------------------------- audio
@@ -357,6 +359,9 @@ class Scene:
         self.rng = np.random.default_rng(seed)
         self.dither = [self.rng.uniform(-0.6, 0.6, (self.h, self.w, 3)).astype(np.float32) for _ in range(4)]
         self.sprites = {}
+        self.notext = False
+        self.ui, self.outro = 1.0, 0.0
+        self.outro_len = 7.0 if (dur >= 20 and W > H) else 0.0
 
     # text --------------------------------------------------------------------------
     def spr(self, txt, weight, size, color=(1, 1, 1), shadow=0.6):
@@ -374,9 +379,9 @@ class Scene:
         return self.sprites[key]
 
     def text(self, full, txt, cx, cy, alpha, weight="light", size=40, color=(1, 1, 1), shadow=0.6,
-             align="center"):
-        alpha *= self.fade
-        if alpha <= 0.004:
+             align="center", brand=False):
+        alpha *= self.fade * (1.0 if brand else self.ui)
+        if alpha <= 0.004 or (self.notext and not brand):
             return
         a, g, col, pad = self.spr(txt, weight, size, color, shadow)
         h, w = a.shape
@@ -399,18 +404,39 @@ class Scene:
         full[y0:y1, x0:x1] = reg.astype(np.uint8)
 
     def watermark(self, full, t):
-        self.text(full, CHANNEL, self.W * 0.035, self.H * 0.06, 0.55 * ramp(t, 0.5, 1e9), "med",
-                  int(self.H * 0.019 if self.W > self.H else self.W * 0.026), align="left", shadow=0.4)
+        if self.notext:
+            return
+        a = 0.75 * ramp(t, 0.5, 1e9) * self.fade * self.ui
+        sz = self.H * 0.019
+        x, y = self.W * 0.035, self.H * 0.06
+        draw_lantern_u8(full, x + sz * 0.5, y, sz * 1.5, 0.8, a)
+        self.text(full, CHANNEL, x + sz * 1.6, y, a, "med", int(sz), (1.0, 0.93, 0.82), align="left", shadow=0.4)
+
+    def brand_outro(self, full, t):
+        """End card: glowing lantern + channel name + subscribe prompt."""
+        if self.outro <= 0.003:
+            return
+        W, H, a = self.W, self.H, self.outro
+        bob = math.sin(t * 1.3) * H * 0.006
+        draw_lantern_u8(full, W / 2, H * 0.38 + bob, H * 0.15, 0.95 + 0.05 * math.sin(t * 5), a * self.fade)
+        self.text(full, CHANNEL_NAME, W / 2, H * 0.60, a, "xlight", int(H * 0.08), (1.0, 0.95, 0.88), brand=True)
+        self.text(full, "Subscribe for more calm  ·  new videos every week", W / 2, H * 0.695, 0.85 * a, "reg",
+                  int(H * 0.028), (1.0, 0.85, 0.65), brand=True)
 
     def finish(self, img, fi):
-        img = img * self.vig * self.fade
+        img = img * self.vig * self.fade * (1 - 0.5 * self.outro)
         u8 = np.clip(img * 255 + self.dither[fi % 4], 0, 255).astype(np.uint8)
         return np.array(Image.fromarray(u8).resize((self.W, self.H), Image.BILINEAR))
 
     def frame(self, fi):
         t = fi / FPS
         self.fade = float(ss(0, 1.5, t) * ss(self.dur, self.dur - 2.5, t))
-        return self.draw(t, fi)
+        if self.outro_len:
+            self.outro = float(ss(self.dur - self.outro_len, self.dur - self.outro_len + 1.5, t))
+            self.ui = 1.0 - self.outro
+        full = self.draw(t, fi)
+        self.brand_outro(full, t)
+        return full
 
 
 def stamp_points(layer, xs, ys, vals, glow=True):
@@ -422,6 +448,97 @@ def stamp_points(layer, xs, ys, vals, glow=True):
     if glow:
         for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
             np.add.at(layer, (iy + dy, ix + dx), vals * 0.35)
+
+
+_LANTERN_CACHE = {}
+
+
+def lantern_sprite(s):
+    """Glowing paper sky-lantern of height s px: (glow RGB additive, body mask, body RGB, radius)."""
+    key = round(s * 2) / 2
+    if key in _LANTERN_CACHE:
+        return _LANTERN_CACHE[key]
+    s = max(key, 2.0)
+    R = int(s * 2.4) + 2
+    yy, xx = np.mgrid[-R:R + 1, -R:R + 1].astype(np.float32)
+    yy = yy + s * 0.08
+    d = np.hypot(xx, yy * 0.9)
+    glow = (np.exp(-d / (s * 0.5)) * 0.55 + np.exp(-d / (s * 1.5)) * 0.2)[..., None] * \
+        np.array([1.0, 0.52, 0.18], np.float32)
+    glow = glow * ss(R - 1, R * 0.45, np.hypot(xx, yy - s * 0.08))[..., None]
+    yn = yy / s
+    half = s * (0.36 - 0.13 * (yn + 0.5))
+    soft = max(0.6, s * 0.03)
+    top = yn + 0.5
+    mx = ss(half + soft, half - soft, np.abs(xx))
+    round_top = ss(1.08, 0.92, (np.abs(xx) / np.maximum(half, 1e-3)) ** 2 * 0.6 + np.clip(0.18 - top, 0, 1) / 0.18 * 0.9)
+    mask = mx * ss(-0.5 - 0.03, -0.5 + 0.03, yn) * ss(0.5 + 0.02, 0.5 - 0.02, yn) * round_top
+    k = np.clip(top, 0, 1)[..., None]
+    body = lerp(np.array([0.78, 0.30, 0.10], np.float32), np.array([1.0, 0.86, 0.52], np.float32), k ** 1.3)
+    xr = np.abs(xx) / np.maximum(half, 1e-3)
+    body = body * (0.82 + 0.25 * (1 - xr ** 2))[..., None]
+    seams = sum(np.exp(-((xx / np.maximum(half, 1e-3) - c) / 0.05) ** 2) for c in (-0.55, 0.0, 0.55))
+    body = body * (1 - 0.16 * np.clip(seams, 0, 1) * min(1, s / 30))[..., None]
+    flame = np.exp(-((xx / (s * 0.07)) ** 2 + ((yn - 0.44) / 0.07) ** 2))[..., None]
+    body = body + flame * np.array([1.0, 0.95, 0.8], np.float32)
+    mask = np.maximum(mask, flame[..., 0] * 0.9)
+    out = (glow.astype(np.float32), mask.astype(np.float32)[..., None], body.astype(np.float32), R)
+    _LANTERN_CACHE[key] = out
+    return out
+
+
+def draw_lantern(img, cx, cy, s, glow_k=1.0, alpha=1.0):
+    """Draw onto a float RGB image (0..1) in place."""
+    if alpha <= 0.003 or s < 1.5:
+        return
+    glow, mask, body, R = lantern_sprite(s)
+    H, W = img.shape[:2]
+    x0, y0 = int(cx) - R, int(cy) - R
+    xs0, ys0, xs1, ys1 = max(0, x0), max(0, y0), min(W, x0 + 2 * R + 1), min(H, y0 + 2 * R + 1)
+    if xs1 <= xs0 or ys1 <= ys0:
+        return
+    sl = (slice(ys0 - y0, ys1 - y0), slice(xs0 - x0, xs1 - x0))
+    reg = img[ys0:ys1, xs0:xs1]
+    reg += glow[sl] * glow_k * alpha
+    reg += (body[sl] * (0.85 + 0.15 * glow_k) - reg) * mask[sl] * alpha
+
+
+def draw_lantern_u8(full, cx, cy, s, glow_k=1.0, alpha=1.0):
+    R = lantern_sprite(s)[3]
+    H, W = full.shape[:2]
+    x0, y0 = max(0, int(cx) - R), max(0, int(cy) - R)
+    x1, y1 = min(W, int(cx) + R + 1), min(H, int(cy) + R + 1)
+    reg = full[y0:y1, x0:x1].astype(np.float32) / 255
+    draw_lantern(reg, cx - x0, cy - y0, s, glow_k, alpha)
+    full[y0:y1, x0:x1] = np.clip(reg * 255, 0, 255).astype(np.uint8)
+
+
+class Lanterns:
+    """A field of floating sky lanterns rising slowly with gentle sway and flicker."""
+
+    def __init__(self, rng, w, h, n, ymin=-0.1, ymax=0.9, smin=5, smax=22, speed=1.0, avoid=None):
+        self.h, self.ymin, self.ymax = h, ymin * h, ymax * h
+        self.items = []
+        for _ in range(n):
+            size = smin + (smax - smin) * rng.random() ** 2.2
+            x = rng.uniform(0.03, 0.97) * w
+            if avoid is not None:
+                while avoid[0] < x / w < avoid[1]:
+                    x = rng.uniform(0.03, 0.97) * w
+            self.items.append(dict(x=x, y0=rng.uniform(self.ymin, self.ymax), s=size, v=speed * (1.5 + size * 0.35),
+                                   amp=size * rng.uniform(0.3, 0.8), fq=rng.uniform(0.05, 0.16), ph=rng.uniform(0, 6.28),
+                                   fl=rng.uniform(0.8, 2.2)))
+        self.items.sort(key=lambda d: d["s"])
+
+    def draw(self, img, t, alpha=1.0):
+        span = self.ymax - self.ymin
+        for it in self.items:
+            y = self.ymax - ((self.ymax - it["y0"] + it["v"] * t) % span)
+            x = it["x"] + it["amp"] * math.sin(2 * math.pi * it["fq"] * t + it["ph"])
+            depth = 0.75 + 0.25 * (y - self.ymin) / span
+            k = 0.85 + 0.15 * math.sin(t * it["fl"] * 3.1 + it["ph"]) * math.sin(t * it["fl"] * 1.7)
+            a = float(ss(self.ymin, self.ymin + span * 0.12, y) * ss(self.ymax, self.ymax - span * 0.06, y))
+            draw_lantern(img, x, y, it["s"] * depth, k, alpha * a)
 
 
 class SleepScene(Scene):
@@ -456,6 +573,8 @@ class SleepScene(Scene):
         self.shoot = [(s, rng.uniform(0.15, 0.55), rng.uniform(0.08, 0.3)) for s in np.arange(17, self.dur - 5, 23)]
         self.lines = ["Close your eyes", "Let your shoulders soften", "Breathe slowly and deeply",
                       "There is nothing you need to do", "You are safe to rest"]
+        self.lan = Lanterns(rng, w, h, 16, ymin=-0.08, ymax=0.86, smin=3 * self.m / 270, smax=13 * self.m / 270,
+                            speed=self.m / 270)
 
     def draw(self, t, fi):
         w, h = self.w, self.h
@@ -484,6 +603,7 @@ class SleepScene(Scene):
         c = ss(0.52, 0.85, self.clouds[:, idx])[..., None] * 0.42 * (1 - self.v[..., None] * 0.6)
         ccol = np.array([0.20, 0.22, 0.36], np.float32) + self.moonlit * np.array([0.5, 0.5, 0.55], np.float32)
         img = lerp(img, ccol, c)
+        self.lan.draw(img, t)
         img += self.mist
         img = lerp(img, np.array([0.05, 0.07, 0.16], np.float32), self.mtn2)
         img = lerp(img, np.array([0.015, 0.02, 0.05], np.float32), self.mtn1)
@@ -510,7 +630,7 @@ class BreatheScene(Scene):
         self.cx, self.cy = self.w / 2, self.h * (0.47 if short else 0.52)
         self.d = np.hypot(self.xx - self.cx, self.yy - self.cy)
         k = ((u + v) / 2)[..., None]
-        self.bg = lerp(np.array([0.03, 0.17, 0.22]), np.array([0.09, 0.06, 0.22]), k).astype(np.float32)
+        self.bg = lerp(np.array([0.04, 0.05, 0.14]), np.array([0.15, 0.06, 0.16]), k).astype(np.float32)
         self.r0, self.r1 = self.m * (0.17 if short else 0.17), self.m * (0.36 if short else 0.33)
         n = 170
         self.pa = rng.uniform(0, 6.28, n)
@@ -524,14 +644,14 @@ class BreatheScene(Scene):
         inhale = ph < self.INH
         r = self.r0 + (self.r1 - self.r0) * b
         d = self.d
-        img = self.bg * (0.8 + 0.3 * b) + np.array([0.10, 0.02, 0.10], np.float32) * b
+        img = self.bg * (0.8 + 0.3 * b) + np.array([0.12, 0.05, 0.0], np.float32) * b
         glow = np.exp(-np.maximum(d - r, 0) / (r * 0.45))[..., None]
-        img += glow * np.array([0.25, 0.55, 0.6], np.float32) * 0.55
+        img += glow * np.array([0.95, 0.50, 0.18], np.float32) * 0.55
         inner = ss(r + 1.5, r - 1.5, d)[..., None]
         kk = np.clip(d / r, 0, 1)[..., None]
-        fill = lerp(np.array([0.80, 0.97, 0.96], np.float32), np.array([0.38, 0.78, 0.86], np.float32), kk ** 1.5)
+        fill = lerp(np.array([1.0, 0.95, 0.80], np.float32), np.array([0.98, 0.64, 0.30], np.float32), kk ** 1.5)
         img = lerp(img, fill, inner * 0.92)
-        img += (np.exp(-((d - r) / 1.3) ** 2) * 0.5)[..., None]
+        img += (np.exp(-((d - r) / 1.3) ** 2) * 0.45)[..., None] * np.array([1, 0.9, 0.75], np.float32)
         cyc_start = t - ph
         for start in (cyc_start, cyc_start - self.CYCLE):
             age = t - start
@@ -543,7 +663,8 @@ class BreatheScene(Scene):
         rad = self.r1 * self.pm * (1.35 - 0.45 * b)
         tw = self.pb * (0.6 + 0.4 * np.sin(t * 1.7 + self.pa * 5))
         stamp_points(layer, self.cx + np.cos(ang) * rad, self.cy + np.sin(ang) * rad, tw.astype(np.float32))
-        img += layer[..., None] * np.array([0.8, 0.95, 1.0], np.float32)
+        img += layer[..., None] * np.array([1.0, 0.8, 0.5], np.float32)
+        img = lerp(img, self.bg * 0.8, self.outro)
         full = self.finish(img, fi)
         W, H = self.W, self.H
         S = H if not self.short else W * 1.0
@@ -551,7 +672,7 @@ class BreatheScene(Scene):
         sec = int(ph) + 1 if inhale else int(ph - self.INH) + 1
         frac = ph % 1
         self.text(full, str(sec), W / 2, cy, 0.85 * (1 - 0.5 * frac) * ramp(t, 1, 1e9, 0.6), "xlight",
-                  int(S * (0.11 if not self.short else 0.14)), (0.05, 0.16, 0.22), shadow=0)
+                  int(S * (0.11 if not self.short else 0.14)), (0.32, 0.14, 0.04), shadow=0)
         a_in = float(ss(0, 0.5, ph) * ss(self.INH, self.INH - 0.5, ph))
         a_out = float(ss(self.INH, self.INH + 0.5, ph) * ss(self.CYCLE, self.CYCLE - 0.5, ph))
         ty = min(cy + self.r1 * 2 + S * 0.10, H * 0.89)
@@ -560,8 +681,8 @@ class BreatheScene(Scene):
         self.text(full, "Breathe out", W / 2, ty, a_out * ramp(t, 0.5, 1e9), "light", ts)
         if not self.short:
             self.text(full, "Calm Breathing", W / 2, H * 0.085, 0.95 * ramp(t, 0.8, 1e9), "light", int(H * 0.048))
-            self.text(full, "Inhale 4  ·  Exhale 6  ·  Follow the circle", W / 2, H * 0.145,
-                      0.7 * ramp(t, 1.5, 1e9), "reg", int(H * 0.024), (0.85, 0.95, 1.0))
+            self.text(full, "Inhale 4  ·  Exhale 6  ·  Follow the lantern's glow", W / 2, H * 0.145,
+                      0.7 * ramp(t, 1.5, 1e9), "reg", int(H * 0.024), (1.0, 0.9, 0.78))
             self.watermark(full, t)
         else:
             hs = int(W * 0.075)
@@ -570,9 +691,11 @@ class BreatheScene(Scene):
             self.text(full, "for 30 seconds", W / 2, H * 0.12 + hs * 1.25, 0.85 * ramp(t, 4.8, self.dur - 5, 0.6),
                       "light", int(hs * 0.7))
             self.text(full, "Feel calmer?", W / 2, H * 0.12, ramp(t, self.dur - 4.7, 1e9, 0.6), "semi", hs)
-            self.text(full, "Follow for daily calm", W / 2, H * 0.12 + hs * 1.25,
+            self.text(full, "Follow Little Lanterns", W / 2, H * 0.12 + hs * 1.25,
                       ramp(t, self.dur - 4.4, 1e9, 0.6), "light", int(hs * 0.7))
-            self.text(full, CHANNEL, W / 2, H * 0.94, 0.6 * ramp(t, 0.5, 1e9), "med", int(W * 0.03), shadow=0.4)
+            a = 0.75 * ramp(t, 0.5, 1e9) * self.fade
+            draw_lantern_u8(full, W / 2, H * 0.905, W * 0.05, 0.9, a)
+            self.text(full, CHANNEL, W / 2, H * 0.945, a, "med", int(W * 0.03), (1.0, 0.93, 0.82), shadow=0.4)
         return full
 
 
@@ -583,7 +706,7 @@ class FocusScene(Scene):
         super().__init__(*a, seed=4)
         w, h, v, rng = self.w, self.h, self.v, self.rng
         self.bg = lerp(np.array([0.035, 0.045, 0.08]), np.array([0.11, 0.07, 0.06]), v[..., None]).astype(np.float32)
-        pal = np.array([[1, .62, .28], [1, .78, .42], [.35, .75, .9], [1, .45, .35], [.95, .9, .7]], np.float32)
+        pal = np.array([[1, .62, .28], [1, .78, .42], [1, .7, .35], [1, .45, .3], [.95, .9, .7], [.4, .7, .85]], np.float32)
         n = 30
         self.bk = [dict(x=rng.uniform(0, w), y=rng.uniform(h * 0.25, h * 1.0), r=rng.uniform(8, 38) * self.m / 270,
                         c=pal[rng.integers(0, len(pal))], f=rng.uniform(0.05, 0.25), p=rng.uniform(0, 6.28),
@@ -678,6 +801,8 @@ class OceanScene(Scene):
         self.xn = self.xx / w
         self.rowph = rng.uniform(0, 6.28, (h, 1)).astype(np.float32)
         self.lines = ["Inhale as the wave rises", "Exhale as it falls back"]
+        self.lan = Lanterns(rng, w, h, 13, ymin=-0.06, ymax=0.97, smin=3 * self.m / 270, smax=15 * self.m / 270,
+                            speed=self.m / 270, avoid=(0.43, 0.57))
 
     def draw(self, t, fi):
         w = self.w
@@ -699,7 +824,8 @@ class OceanScene(Scene):
         water += (sparkle * 0.75)[..., None] * np.array([1.0, 0.9, 0.7], np.float32)
         water += (foam * 0.12)[..., None]
         water += (np.exp(-p / 0.012) * 0.25)[..., None] * np.array([1, 0.75, 0.55], np.float32)
-        img = np.where(self.water, water, sky)
+        img = np.where(self.water, water, sky).astype(np.float32)
+        self.lan.draw(img, t)
         full = self.finish(img, fi)
         W, H = self.W, self.H
         self.text(full, "Ocean Sunset", W / 2, H * 0.17, ramp(t, 1.5, 12), "xlight", int(H * 0.085))
